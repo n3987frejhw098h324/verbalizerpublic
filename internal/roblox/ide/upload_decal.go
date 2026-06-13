@@ -1,0 +1,72 @@
+package ide
+
+import (
+	"bytes"
+	"errors"
+
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/roblox"
+)
+
+var UploadDecalErrors = struct {
+	ErrNotLoggedIn       error
+	ErrTokenInvalid      error
+	ErrInappropriateName error
+}{
+	ErrNotLoggedIn:       errors.New("you appear to be signed out - your Roblox cookie may have expired"),
+	ErrTokenInvalid:      errors.New("Roblox rejected the request's security token (it will refresh and retry automatically)"),
+	ErrInappropriateName: errors.New("Roblox moderation flagged the decal's name or description"),
+}
+
+func NewUploadDecalHandler(
+	c *roblox.Client,
+	name,
+	description string,
+	data *bytes.Buffer,
+	contentType string,
+	groupID ...int64,
+) (func() (int64, error), error) {
+	var group int64
+	if len(groupID) > 0 {
+		group = groupID[0]
+	}
+	if contentType == "" {
+		contentType = "image/png"
+	}
+	currentName := name
+
+	return func() (int64, error) {
+		req, err := newCreateAssetRequest(
+			"Decal",
+			currentName,
+			description,
+			data,
+			contentType,
+			func() int64 {
+				if group > 0 {
+					return group
+				}
+				return c.UserInfo.ID
+			}(),
+			group > 0,
+		)
+		if err != nil {
+			return 0, err
+		}
+
+		id, err := executeCreateAsset(c, req, UploadDecalErrors.ErrTokenInvalid, UploadDecalErrors.ErrNotLoggedIn)
+		if err == nil {
+			return id, nil
+		}
+
+		if errors.Is(err, ErrAccountModerated) {
+			return 0, err
+		}
+
+		if isInappropriateError(err.Error()) {
+			currentName = "[Censored]"
+			return 0, UploadDecalErrors.ErrInappropriateName
+		}
+
+		return 0, err
+	}, nil
+}

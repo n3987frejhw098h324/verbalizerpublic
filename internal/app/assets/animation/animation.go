@@ -1,0 +1,429 @@
+package animation
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/app/assets/shared/assetutils"
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/app/assets/shared/clientutils"
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/app/config"
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/app/context"
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/app/request"
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/app/response"
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/atomicarray"
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/retry"
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/roblox/assetdelivery"
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/roblox/develop"
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/roblox/games"
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/roblox/ide"
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/shardedmap"
+	"github.com/n3987frejhw098h324/verbalizerpublic/internal/taskqueue"
+)
+
+const assetTypeID int32 = 24
+const animationUploadRetryTries = 5
+
+const animationSuccessDrainEvery = 300
+const animationSuccessDrainPause = 1500 * time.Millisecond
+
+const animationMaxParallelChunks = 6
+
+var ErrUnauthorized = errors.New("could not access the asset - you may be signed out, or the asset is private")
+
+func Reupload(ctx *context.Context, r *request.Request) {
+	client := ctx.Client
+	logger := ctx.Logger
+	pauseController := ctx.PauseController
+	resp := ctx.Response
+
+	idsToUpload := len(r.IDs)
+	var idsProcessed atomic.Int32
+
+	defaultPlaceIDs := append([]int64(nil), r.DefaultPlaceIDs...)
+	defaultPlaceIDsMap := make(map[int64]struct{}, len(defaultPlaceIDs))
+	for _, placeID := range defaultPlaceIDs {
+		defaultPlaceIDsMap[placeID] = struct{}{}
+	}
+	if r.PlaceID > 0 {
+		if _, exists := defaultPlaceIDsMap[r.PlaceID]; !exists {
+			defaultPlaceIDs = append(defaultPlaceIDs, r.PlaceID)
+			defaultPlaceIDsMap[r.PlaceID] = struct{}{}
+		}
+	}
+
+	var groupID int64
+	if r.IsGroup {
+		groupID = r.CreatorID
+	}
+
+	creatorPlaceMap := shardedmap.New[*atomicarray.AtomicArray[int64]]()
+	creatorMutexMap := shardedmap.New[*sync.RWMutex]()
+
+	nClients := ctx.Clients.Len()
+	uploadQueue := taskqueue.NewSmoothQueue[int64](config.GetInt("animation_max_concurrent_uploads")*nClients, config.GetInt("animation_uploads_per_minute")*nClients)
+	var uploadSuccessCount atomic.Uint64
+
+	rateLimitPause := time.Duration(config.GetInt("rate_limit_pause_seconds")) * time.Second
+	quiesce := assetutils.NewQuiesce()
+
+	groupGameQueue := taskqueue.New[*games.GamesResponse](time.Second*5, 8)
+	userGameQueue := taskqueue.New[*games.GamesResponse](time.Second*5, 8)
+
+	logger.Println("Reuploading animations...")
+
+	reporter := assetutils.NewReporter(logger, idsToUpload, &idsProcessed, resp)
+	resp.SetProgress(idsToUpload, &idsProcessed)
+	ctx.StartProgress()
+	defer ctx.StopProgress()
+
+	uploadAsset := func(wg *sync.WaitGroup, assetInfo *develop.AssetInfo, location string) {
+		defer wg.Done()
+
+		if ctx.Cancelled() {
+			return
+		}
+
+		uploadClient := ctx.Clients.Next()
+
+		oldName := assetInfo.Name
+		resp.SetCurrent(assetInfo.Name)
+
+		assetData, err := clientutils.GetRequest(uploadClient, location)
+		if err != nil {
+			reporter.UploadError("Failed to get asset data", assetInfo, err)
+			return
+		}
+
+		uploadHandler, err := ide.NewUploadAnimationHandler(uploadClient, assetInfo.Name, "", assetData, groupID)
+		if err != nil {
+			reporter.UploadError("Failed to get upload handler", assetInfo, err)
+			return
+		}
+
+		newID, err := retry.Do(
+			retry.NewOptions(
+				retry.Tries(animationUploadRetryTries),
+				retry.Delay(900*time.Millisecond),
+			),
+			func(_ int) (int64, error) {
+				for {
+					if ctx.Cancelled() {
+						return 0, &retry.ExitRetry{Err: assetutils.ErrStopped}
+					}
+
+					pauseController.WaitIfPaused()
+					quiesce.Wait()
+
+					res := <-uploadQueue.QueueTask(uploadHandler)
+					id, err := res.Result, res.Error
+					if err == nil {
+						return id, nil
+					}
+
+					if errors.Is(err, ide.ErrRateLimited) {
+						quiesce.Extend(rateLimitPause)
+						continue
+					}
+
+					if errors.Is(err, ide.ErrAccountModerated) {
+						assetutils.StopForModeration(ctx)
+						return 0, &retry.ExitRetry{Err: assetutils.ErrStopped}
+					}
+
+					switch err {
+					case ide.UploadAnimationErrors.ErrNotLoggedIn:
+						clientutils.GetNewCookie(ctx, r, uploadClient, "cookie expired")
+					case ide.UploadAnimationErrors.ErrInappropriateName:
+						assetInfo.Name = fmt.Sprintf("(%s) [Censored]", assetInfo.Name)
+					}
+
+					reporter.Retry(assetInfo, err)
+					return 0, &retry.ContinueRetry{Err: err}
+				}
+			},
+		)
+		if err != nil {
+			assetInfo.Name = oldName
+			if ctx.Cancelled() {
+				return
+			}
+			reporter.UploadError("Failed to upload", assetInfo, err)
+			assetutils.NoteUploadFailure(ctx, uploadClient)
+			return
+		}
+		ctx.Clients.ReportSuccess(uploadClient)
+
+		if n := uploadSuccessCount.Add(1); n%uint64(animationSuccessDrainEvery) == 0 {
+			time.Sleep(animationSuccessDrainPause)
+		}
+
+		reporter.Success(assetInfo, newID)
+		resp.AddItem(response.ResponseItem{
+			OldID: assetInfo.ID,
+			NewID: newID,
+		})
+		if err := ctx.Checkpoint.Record(assetInfo.ID, newID); err != nil {
+			logger.Error("Failed to save reupload checkpoint: ", err)
+		}
+	}
+
+	getCreatorPlaceCache := func(creatorID int64, creatorType string) (*atomicarray.AtomicArray[int64], error) {
+		creatorShard, exists := creatorPlaceMap.GetShard(creatorType)
+		mutexShard, _ := creatorMutexMap.GetShard(creatorType)
+		if !exists {
+			creatorShard = creatorPlaceMap.NewShard(creatorType)
+			mutexShard = creatorMutexMap.NewShard(creatorType)
+		}
+
+		if cache, cacheExists := creatorShard.Get(creatorID); cacheExists {
+			return cache, nil
+		}
+
+		mutex, mutexExists := mutexShard.Get(creatorID)
+		if !mutexExists {
+			mutex = &sync.RWMutex{}
+			mutexShard.Set(creatorID, mutex)
+		}
+
+		mutex.Lock()
+		defer mutex.Unlock()
+
+		if cache, cacheExists := creatorShard.Get(creatorID); cacheExists {
+			return cache, nil
+		}
+
+		var resp *games.GamesResponse
+		var err error
+		for {
+			pauseController.WaitIfPaused()
+			quiesce.Wait()
+
+			if creatorType == "Group" {
+				queueRes := <-groupGameQueue.QueueTask(func() (*games.GamesResponse, error) {
+					return games.GroupGames(client, creatorID)
+				})
+				resp = queueRes.Result
+				err = queueRes.Error
+			} else {
+				queueRes := <-userGameQueue.QueueTask(func() (*games.GamesResponse, error) {
+					return games.UserGames(client, creatorID)
+				})
+				resp = queueRes.Result
+				err = queueRes.Error
+			}
+
+			if err != nil && errors.Is(err, games.ErrRateLimited) {
+				quiesce.Extend(rateLimitPause)
+				continue
+			}
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		ids := make([]int64, 0, len(defaultPlaceIDs))
+		for _, placeInfo := range resp.Data {
+			rootPlaceID := placeInfo.RootPlace.ID
+
+			if _, exists := defaultPlaceIDsMap[rootPlaceID]; exists {
+				continue
+			}
+			ids = append(ids, rootPlaceID)
+		}
+		ids = append(ids, defaultPlaceIDs...)
+
+		cache := atomicarray.New(&ids)
+		creatorShard.Set(creatorID, cache)
+		mutexShard.Remove(creatorID)
+		return cache, nil
+	}
+
+	getAssetLocations := func(body []*assetdelivery.AssetRequestItem, placeID int64) ([]*assetdelivery.AssetLocation, error) {
+		runGetLocations := func(handler func() ([]*assetdelivery.AssetLocation, error)) ([]*assetdelivery.AssetLocation, error) {
+			return retry.Do(
+				retry.NewOptions(retry.Tries(3)),
+				func(_ int) ([]*assetdelivery.AssetLocation, error) {
+					for {
+						pauseController.WaitIfPaused()
+						quiesce.Wait()
+
+						locations, err := handler()
+						if err != nil {
+							if errors.Is(err, assetdelivery.ErrRateLimited) {
+								quiesce.Extend(rateLimitPause)
+								continue
+							}
+							logger.Verbose(fmt.Sprintf("Retrying asset-location lookup: %v", err))
+							return locations, &retry.ContinueRetry{Err: err}
+						}
+
+						for _, assetLocation := range locations {
+							errs := assetLocation.Errors
+							if len(errs) == 0 {
+								continue
+							}
+							if errs[0].Message == "Authentication required to access Asset." {
+								clientutils.GetNewCookie(ctx, r, client, "cookie expired")
+								return locations, &retry.ContinueRetry{Err: ErrUnauthorized}
+							}
+						}
+
+						return locations, nil
+					}
+				},
+			)
+		}
+
+		handlerWithPlace, err := assetdelivery.NewBatchHandler(client, body, placeID)
+		if err != nil {
+			return nil, err
+		}
+		locations, withPlaceErr := runGetLocations(handlerWithPlace)
+		if withPlaceErr == nil {
+			for _, assetLocation := range locations {
+				if len(assetLocation.Locations) > 0 {
+					return locations, nil
+				}
+			}
+		}
+
+		handlerWithoutPlace, err := assetdelivery.NewBatchHandler(client, body)
+		if err != nil {
+			if withPlaceErr != nil {
+				return nil, withPlaceErr
+			}
+			return locations, nil
+		}
+		fallbackLocations, fallbackErr := runGetLocations(handlerWithoutPlace)
+		if fallbackErr != nil {
+			if withPlaceErr != nil {
+				return nil, withPlaceErr
+			}
+			return nil, fallbackErr
+		}
+		return fallbackLocations, nil
+	}
+
+	batchUpload := func(wg *sync.WaitGroup, creatorID int64, creatorType string, creatorAssets []*develop.AssetInfo) {
+		defer wg.Done()
+
+		placeCache, err := getCreatorPlaceCache(creatorID, creatorType)
+		if err != nil {
+			reporter.BatchError(len(creatorAssets), "Failed to get creator places", err)
+			return
+		}
+
+		assetInfoMap := make(map[int64]*develop.AssetInfo)
+		ids := make([]int64, len(creatorAssets))
+		for i, assetInfo := range creatorAssets {
+			ids[i] = assetInfo.ID
+			assetInfoMap[assetInfo.ID] = assetInfo
+		}
+		body := assetutils.NewBatchBodyFromIDs(ids)
+
+		var uploadWG sync.WaitGroup
+		creatorPlaceCache := placeCache.Load()
+		if len(creatorPlaceCache) == 0 {
+			for _, req := range body {
+				assetInfo := assetInfoMap[req.AssetID]
+				reporter.UploadError("Failed to get asset location", assetInfo, "no place IDs (add place(s) under Filter, or ensure the creator has a discoverable experience)")
+			}
+			return
+		}
+
+		lastLocationErrorByAssetID := make(map[int64]string)
+		for _, placeID := range creatorPlaceCache {
+			assetLocations, err := getAssetLocations(body, placeID)
+			if err != nil {
+				continue
+			}
+			for i, assetLocation := range assetLocations {
+				if len(assetLocation.Locations) > 0 || i >= len(body) {
+					continue
+				}
+				if errs := assetLocation.Errors; len(errs) > 0 {
+					lastLocationErrorByAssetID[body[i].AssetID] = errs[0].Message
+				}
+			}
+
+			var hadSuccess bool
+			for assetIndex, assetLocation := range slices.Backward(assetLocations) {
+				if len(assetLocation.Locations) == 0 {
+					continue
+				}
+				hadSuccess = true
+
+				assetID := body[assetIndex].AssetID
+				body = slices.Delete(body, assetIndex, assetIndex+1)
+
+				uploadWG.Add(1)
+				go uploadAsset(&uploadWG, assetInfoMap[assetID], assetLocation.Locations[0].Location)
+			}
+			if hadSuccess && len(creatorPlaceCache) > 1 {
+				atomicarray.MoveToFront(placeCache, placeID)
+			}
+			if len(body) == 0 {
+				break
+			}
+		}
+
+		for _, req := range body {
+			assetInfo := assetInfoMap[req.AssetID]
+			if lastErr, hasSpecificErr := lastLocationErrorByAssetID[req.AssetID]; hasSpecificErr && lastErr != "" {
+				reporter.UploadError("Failed to get asset location", assetInfo, lastErr)
+				continue
+			}
+			reporter.UploadError("Failed to get asset location", assetInfo, "no download URL from any place (tried creator places and fallback without placeId)")
+		}
+
+		uploadWG.Wait()
+	}
+
+	batchProcess := func(wg *sync.WaitGroup, filteredInfo []*develop.AssetInfo) {
+		defer wg.Done()
+
+		if len(filteredInfo) == 0 {
+			return
+		}
+
+		CreatorAssets := assetutils.GroupByCreator(filteredInfo)
+
+		var uploadWG sync.WaitGroup
+		for creatorType, creatorAssetMap := range CreatorAssets {
+			uploadWG.Add(len(creatorAssetMap))
+
+			for creatorID, creatorAssets := range creatorAssetMap {
+				go batchUpload(&uploadWG, creatorID, creatorType, creatorAssets)
+			}
+		}
+		uploadWG.Wait()
+	}
+
+	kept, report := assetutils.Classify(ctx, r, quiesce, rateLimitPause, "animations", assetTypeID)
+	idsProcessed.Add(int32(report.Total()))
+	resp.SetSkipSummary(report.Lines("animations"), report.AlreadyYours+report.WrongType+report.NotFound)
+	for _, line := range report.Lines("animations") {
+		logger.Println(line)
+	}
+	if len(kept) == 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	chunks := assetutils.ChunkAssets(kept, assetutils.AssetsInfoChunkSize)
+	wg.Add(len(chunks))
+	chunkSlots := make(chan struct{}, animationMaxParallelChunks)
+	for _, chunk := range chunks {
+		chunkSlots <- struct{}{}
+		go func(c []*develop.AssetInfo) {
+			defer func() { <-chunkSlots }()
+			batchProcess(&wg, c)
+		}(chunk)
+	}
+	wg.Wait()
+}
